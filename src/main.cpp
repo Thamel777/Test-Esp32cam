@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <WebServer.h>
 #include "esp_camera.h"
 
 // ===========================
@@ -27,20 +28,87 @@ const char* password = "BCI#campus";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-WiFiServer server(80);
+// Must match the ESP32-S3 Firmware 2.5.0 backup AP credentials.
+const char* fallbackSsid = "ESP32-S3-N16R8";
+const char* fallbackPassword = "change-this-password";
+const unsigned long WIFI_TIMEOUT_MS = 15000;
+WebServer server(80);
+bool cameraReady = false;
+
+bool waitForWiFi() {
+  const unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void handleRequest() {
+  const String path = server.uri();
+  if (path != "/" && path != "/capture") {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+  if (server.method() != HTTP_GET) {
+    server.sendHeader("Allow", "GET");
+    server.send(405, "text/plain", "Method not allowed");
+    return;
+  }
+  if (!cameraReady) {
+    server.send(503, "text/plain", "Camera unavailable");
+    return;
+  }
+  if (path == "/") {
+    server.send(200, "text/plain", "ESP32-CAM ready");
+    return;
+  }
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  uint8_t* out_buf = nullptr;
+  size_t out_len = 0;
+  const bool converted = frame2jpg(fb, 80, &out_buf, &out_len);
+  esp_camera_fb_return(fb);
+  if (!converted || !out_buf || out_len == 0) {
+    free(out_buf);
+    server.send(500, "text/plain", "JPEG compression failed");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(out_len);
+  server.send(200, "image/jpeg", "");
+  server.sendContent(reinterpret_cast<const char*>(out_buf), out_len);
+  free(out_buf);
+}
 
 void setup() {
   Serial.begin(115200);
   
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  Serial.print("Connecting to primary WiFi");
+  if (!waitForWiFi()) {
+    Serial.println("\nPrimary WiFi timed out; trying ESP32-S3 backup AP.");
+    WiFi.disconnect();
+    if (!WiFi.config(IPAddress(192, 168, 4, 2), IPAddress(192, 168, 4, 1),
+                     IPAddress(255, 255, 255, 0))) {
+      Serial.println("Static fallback IP configuration failed.");
+      return;
+    }
+    WiFi.begin(fallbackSsid, fallbackPassword);
+    if (!waitForWiFi()) {
+      Serial.println("\nBackup WiFi timed out. Restart after checking AP credentials.");
+      return;
+    }
   }
   Serial.println("\nWiFi connected.");
 
-  camera_config_t config;
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -71,11 +139,11 @@ void setup() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
-    return;
   }
+  cameraReady = (err == ESP_OK);
   
   // Diagnostic output
-  sensor_t * s = esp_camera_sensor_get();
+  sensor_t * s = cameraReady ? esp_camera_sensor_get() : nullptr;
   if (s) {
       Serial.printf("Sensor PID: 0x%x\n", s->id.PID);
   }
@@ -86,6 +154,9 @@ void setup() {
     Serial.println("PSRAM Status: NOT DETECTED");
   }
 
+  server.on("/", HTTP_ANY, handleRequest);
+  server.on("/capture", HTTP_ANY, handleRequest);
+  server.onNotFound(handleRequest);
   server.begin();
   Serial.println("==================================");
   Serial.print("Camera Ready! Go to: http://");
@@ -94,35 +165,5 @@ void setup() {
 }
 
 void loop() {
-  WiFiClient client = server.available();
-  if (client) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if(!fb) {
-      Serial.println("Camera capture failed");
-      client.stop();
-      return;
-    }
-    
-    // Attempt to convert to JPEG (since the sensor doesn't do it)
-    uint8_t * out_buf = NULL;
-    size_t out_len = 0;
-    bool jpeg_converted = frame2jpg(fb, 80, &out_buf, &out_len);
-    
-    // Send HTTP response
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-type: image/jpeg");
-    client.println("Connection: close");
-    client.println();
-    
-    // Send image data
-    if (jpeg_converted) {
-      client.write(out_buf, out_len);
-      free(out_buf); // Free the software-encoded JPEG buffer
-    } else {
-      Serial.println("JPEG compression failed");
-    }
-    
-    esp_camera_fb_return(fb); // Free the camera frame buffer
-    client.stop();
-  }
+  server.handleClient();
 }
